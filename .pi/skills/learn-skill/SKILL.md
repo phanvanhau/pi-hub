@@ -1,6 +1,14 @@
 ---
 name: learn-skill
-description: Learning capture workflow. Use when the user wants to save an interesting pattern, insight, or knowledge discovered during the current session into a dated markdown file for their personal learning journey. Triggered by phrases like "save this", "note this", "learn this", "capture this learning", or explicitly with /skill:learn-skill.
+description: >-
+  Learning capture workflow. Saves interesting patterns, insights, or knowledge
+  into a dated markdown file for the user's personal learning journey. Triggered
+  by "save this", "note this", "learn this", "capture this learning", or
+  explicitly with /skill:learn-skill. When no relevant topic is found in the
+  current session, falls back to project-codebase exploration: asks for user
+  confirmation via an interactive dialog, then reads project files (README,
+  manifests, source) to extract knowledge domains and lets the user pick one
+  before generating the learning entry.
 ---
 
 # Learn Skill
@@ -11,9 +19,60 @@ You are in **learning capture mode**. Your job is to crystallize the most valuab
 
 ## Phase 1 — Determine Scope & Prompt
 
-1. If the user provided an explicit focus prompt (e.g., `/skill:learn-skill how mermaid diagrams work in markdown`), use that as the primary topic scope.
-2. If no prompt was given, review the **entire current session** to identify the single most interesting, reusable, or insightful pattern or concept discovered.
-3. If the topic is ambiguous or spans multiple unrelated areas, ask the user one clarifying question: *"Which topic should I focus on for this learning entry?"* — but only if truly necessary. Prefer making a smart choice.
+Evaluate the session and user input, then follow **exactly one** of the three branches below.
+
+### Branch A — Session match (topic found)
+
+1. If the user provided an explicit focus prompt (e.g., `/skill:learn-skill how mermaid diagrams work in markdown`), use that as the primary topic scope and proceed directly to **Phase 2**.
+2. If no explicit prompt was given, review the **entire current session** to identify a concrete, reusable insight, pattern, or concept that was actually discussed or demonstrated. If a clear topic is identifiable, proceed to **Phase 2**.
+
+### Branch B — No session match (topic not found)
+
+3. If **no** meaningful learning topic can be grounded in the current session — for example, the session is empty, or the user's query refers to a concept not discussed at all — do **not** fabricate content and do **not** ask the user a generic question. Instead, proceed to **Phase 1b** to offer project-codebase exploration as a fallback.
+
+> **Signal for Branch B:** the session contains fewer than two substantive assistant turns, OR the user's explicit query names a technology / concept with zero coverage in the conversation.
+
+### Branch C — Ambiguous (multiple candidates)
+
+4. If the session contains several equally valid topics and it is genuinely unclear which one the user wants, ask one targeted clarifying question: *"Which topic should I focus on for this learning entry?"* — then proceed to **Phase 2** with the answer. Prefer making a smart automatic choice; use Branch C only when truly necessary.
+
+---
+
+## Phase 1b — Request User Confirmation for Project Exploration
+
+> **Enter this phase only from Branch B of Phase 1.** Do not enter it if a session topic was found.
+
+Before reading any project files, you must obtain explicit user consent via the `confirm_project_exploration` tool provided by the `learn-skill` Pi extension.
+
+### Step 1 — Call the confirmation tool
+
+Invoke the tool with the user's original query text:
+
+```
+confirm_project_exploration({ query: "<the user's original query or topic>" })
+```
+
+The tool will display an interactive confirmation dialog to the user explaining that you are about to read project files to find relevant learning material.
+
+### Step 2 — Interpret the response
+
+The tool returns an object with two fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `confirmed` | `boolean` | `true` = user approved exploration; `false` = user declined |
+| `scope` | `string` (optional) | A free-text hint the user typed to focus exploration (e.g. "focus on the auth module") |
+
+### Step 3 — Act on the response
+
+**If `confirmed` is `false`:**
+- Stop immediately. Do not explore the filesystem. Do not write any file.
+- Print exactly: `🚫 Learning capture cancelled. No files were written.`
+- Return to normal session mode.
+
+**If `confirmed` is `true`:**
+- If a non-empty `scope` hint was provided, keep it in mind to **narrow** the exploration in Phase 2b (e.g., only look inside the hinted directory or module).
+- Proceed to **Phase 2** to resolve the output location, then to **Phase 2b** to explore the project.
 
 ---
 
@@ -28,6 +87,66 @@ Resolve the output directory using this priority order:
 Then:
 - If the resolved directory does not exist, create it with `bash`: `mkdir -p <directory>`
 - Confirm the resolved path to the user in a single line before writing: `📁 Saving to: <resolved_path>`
+
+---
+
+## Phase 2b — Guided Project Exploration
+
+> **Enter this phase only when coming from Phase 1b with `confirmed: true`.** Skip entirely when a session topic was found in Phase 1.
+
+Your goal is to read the project with read-only tools, derive a list of candidate **knowledge domains**, pick the best one matching the user's query, and hand it off to Phase 3 as the topic.
+
+### Step 1 — Gather structural context
+
+Run these probes in order (stop early if the picture is already clear):
+
+1. `bash ls -1 .` — list the project root to understand its type.
+2. `read README.md` (or `README.rst` / `README.txt`) if present — extracts the project's stated purpose.
+3. `read package.json` / `pyproject.toml` / `Cargo.toml` / `go.mod` (whichever exist) — extracts technology stack, dependencies, and scripts.
+4. `bash find . -maxdepth 3 -type f -name "*.md" | head -30` — locate existing docs and learning files for prior-art awareness.
+5. If a `scope` hint was provided in Phase 1b, also run: `bash find . -maxdepth 4 -type f | grep -i "<scope>" | head -20` to surface relevant files.
+6. `read` up to **3 representative source files** in the main source directory (e.g., `src/`, `lib/`, `app/`) to understand dominant patterns. Choose files that look like the core logic, not auto-generated code.
+
+> **Read-only constraint**: use only `read`, `bash` (non-mutating commands), `ls`, `find`, and `grep`. Do not write or edit any files during exploration.
+
+### Step 2 — Synthesise candidate knowledge domains
+
+From the gathered information, identify **2–5 concrete knowledge domains** that a learner could capture as a reusable reference. A knowledge domain is a concept, pattern, or technique — not a filename. Examples:
+
+- ✅ "React custom hook pattern for data fetching"
+- ✅ "Rust error-handling with `thiserror` and `anyhow`"
+- ❌ "The file `src/hooks/useFetch.ts`" (too specific, not a domain)
+- ❌ "The project" (too vague)
+
+Match each candidate against the user's original query. Score by relevance.
+
+### Step 3 — Select or ask
+
+**Automatic selection** (preferred): if one candidate is clearly the best match for the user's query, select it and proceed to Phase 3 without interrupting the user.
+
+**Ask via `questionnaire`** (only when genuinely ambiguous): if two or more candidates are equally relevant, invoke the `questionnaire` tool to let the user choose:
+
+```
+questionnaire({
+  questions: [{
+    id: "domain",
+    label: "Topic",
+    prompt: "Which knowledge domain should I capture from this project?",
+    options: [
+      { value: "domain-1", label: "<candidate 1>" },
+      { value: "domain-2", label: "<candidate 2>" },
+      ...
+    ],
+    allowOther: true
+  }]
+})
+```
+
+If the user selects "Type something" (allowOther), use their typed text as the topic.
+
+### Step 4 — Hand off to Phase 3
+
+Set the selected knowledge domain as the topic scope and proceed to **Phase 3** (Generate the Learning File). The topic enriched by project exploration should result in a deeper, more concrete learning entry than a generic description — include specific code patterns, APIs, or idioms discovered during Step 1.
 
 ---
 
